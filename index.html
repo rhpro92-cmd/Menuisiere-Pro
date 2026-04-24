@@ -240,12 +240,14 @@ const STATUS={
 const TABS=[
   {id:'chantier',l:'CHANTIER',i:'📷'},
   {id:'cotes',l:'COTES',i:'📐'},
+  {id:'dessin',l:'DESSIN',i:'✏'},
   {id:'agent',l:'AGENT IA',i:'🎤'},
   {id:'conception',l:'3D',i:'✦'},
   {id:'debit',l:'DÉBIT',i:'📋'},
   {id:'coupe',l:'DÉCOUPE',i:'✂'},
   {id:'atelier',l:'ATELIER',i:'🏭'},
 ];
+
 
 // ═══════════════════════════════
 // STATE
@@ -489,16 +491,33 @@ Réponds en français, de façon concise et professionnelle.`;
 async function callAI(msgs, img64){
   const p=currentProject;
   const {w,h,d,E,profC,largInt,largTab}=getDims();
-  const ctx=`Type=${p.type}, HOT=${w}×${h}×${d}mm, Mat=${p.mat.name}(${E}mm), Facade=${p.hasFacade?((p.matFacade?p.matFacade.name:p.mat.name)+'facade'):'non'}, ProfCarcasse=${profC}mm, LargInt=${largInt}mm, Tablette=${largTab}mm`;
-  const sys=AI_SYS.replace('{CTX}',ctx);
+  const ctx2=`Type=${p.type}, HOT=${w}x${h}x${d}mm, Mat=${p.mat.name}(${E}mm), Facade=${p.hasFacade?((p.matFacade?p.matFacade.name:p.mat.name)+'facade'):'non'}, ProfCarcasse=${profC}mm, LargInt=${largInt}mm, Tablette=${largTab}mm`;
+  const sys=AI_SYS.replace('{CTX}',ctx2);
   const last=msgs[msgs.length-1];
-  const content=img64?[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img64}},{type:'text',text:last.content}]:last.content;
-  const r=await fetch('https://api.anthropic.com/v1/messages',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,system:sys,messages:[...msgs.slice(0,-1),{role:last.role,content}]})
-  });
-  const d2=await r.json();
-  return d2.content?.map(b=>b.text||'').join('')||'';
+  const msgContent=img64?[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img64}},{type:'text',text:last.content}]:last.content;
+  const apiMsgs=[...msgs.slice(0,-1),{role:last.role,content:msgContent}];
+  const controller=new AbortController();
+  const tid=setTimeout(()=>controller.abort(),28000);
+  try{
+    const resp=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,system:sys,messages:apiMsgs}),
+      signal:controller.signal
+    });
+    clearTimeout(tid);
+    if(!resp.ok){
+      const errBody=await resp.text();
+      throw new Error('Erreur API '+resp.status+'. Connectez-vous sur claude.ai puis réessayez.');
+    }
+    const data=await resp.json();
+    if(data.error) throw new Error(data.error.message||'Erreur API Claude');
+    return data.content?.map(b=>b.text||'').join('')||'Réponse vide.';
+  }catch(err){
+    clearTimeout(tid);
+    if(err.name==='AbortError') throw new Error('Délai dépassé (28s). Vérifiez votre connexion internet.');
+    throw err;
+  }
 }
 
 function parseAndExecuteActions(reply){
@@ -540,7 +559,9 @@ async function sendAgentMessage(text){
     const cleaned=parseAndExecuteActions(reply);
     currentProject.designChat=[...currentProject.designChat,{role:'assistant',content:cleaned}];
   }catch(e){
-    currentProject.designChat=[...currentProject.designChat,{role:'assistant',content:'⚠ Erreur connexion. Vérifiez votre connexion internet et que vous êtes connecté à Claude.ai.'}];
+    const errMsg=e.message||'Erreur inconnue';
+    currentProject.designChat=[...currentProject.designChat,{role:'assistant',content:'⚠ '+errMsg}];
+    console.error('AI Error:',e);
   }
   isAiLoading=false;
   renderAgentChat();
@@ -975,6 +996,7 @@ function renderTabContent(){
   p._total=costs.total;
 
   if(currentTab==='chantier') renderChantier(c,p);
+  else if(currentTab==='dessin') renderDrawTab(c);
   else if(currentTab==='cotes') renderCotes(c,p,costs);
   else if(currentTab==='agent') renderAgent(c,p);
   else if(currentTab==='conception') renderConception(c,p,costs);
@@ -1580,6 +1602,414 @@ self.addEventListener('fetch',e=>e.respondWith(caches.match(e.request).then(r=>r
 // BOOT
 // ═══════════════════════════════
 render();
+
+
+// ═══════════════════════════════════════════════════════════
+// MODULE DE DESSIN — Apple Pencil Pro optimisé
+// ═══════════════════════════════════════════════════════════
+
+const DRAW_CSS = `
+#draw-canvas-wrap{position:relative;width:100%;touch-action:none;user-select:none;-webkit-user-select:none;}
+#draw-canvas{display:block;width:100%;touch-action:none;cursor:crosshair;background:#0A0A0A;border-radius:10px;}
+.draw-toolbar{display:flex;align-items:center;gap:6px;padding:10px 14px;background:#0D0D0D;border-radius:10px;margin-bottom:10px;flex-wrap:wrap;border:1px solid #1E1E1E;}
+.draw-tool-btn{width:38px;height:38px;border-radius:8px;border:1px solid #2A2A2A;background:#111;color:#888;font-size:16px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .15s;flex-shrink:0;}
+.draw-tool-btn.active{border-color:#D4A853;background:rgba(212,168,83,.2);color:#D4A853;}
+.draw-tool-btn:active{transform:scale(.92);}
+.draw-sep{width:1px;height:28px;background:#2A2A2A;margin:0 2px;flex-shrink:0;}
+.draw-color-btn{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer;flex-shrink:0;transition:border-color .15s;}
+.draw-color-btn.active{border-color:#D4A853;}
+.stroke-slider{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:#2A2A2A;outline:none;width:70px;}
+.stroke-slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#D4A853;cursor:pointer;}
+.snap-indicator{position:absolute;top:8px;right:10px;font-size:10px;color:#D4A853;font-family:'DM Mono',monospace;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:10px;pointer-events:none;opacity:0;transition:opacity .3s;}
+.snap-indicator.show{opacity:1;}
+.shape-ghost{position:absolute;pointer-events:none;top:0;left:0;width:100%;height:100%;}
+`;
+
+const DRAW_COLORS = [
+  {id:'white',hex:'#F5ECD7',label:'Blanc'},
+  {id:'gold',hex:'#D4A853',label:'Or'},
+  {id:'red',hex:'#E84040',label:'Rouge'},
+  {id:'blue',hex:'#4A90E2',label:'Bleu'},
+  {id:'green',hex:'#40C87A',label:'Vert'},
+  {id:'gray',hex:'#888888',label:'Gris'},
+  {id:'black',hex:'#0A0A0A',label:'Noir'},
+];
+
+let drawState = {
+  tool: 'pen',       // pen | line | rect | circle | arrow | text | eraser | select
+  color: '#F5ECD7',
+  strokeWidth: 2,
+  snapAngle: true,   // snap lignes à 0/45/90°
+  snapShape: true,   // correction formes
+  strokes: [],       // historique de tout
+  redoStack: [],
+  currentStroke: null,
+  isDrawing: false,
+  startX: 0, startY: 0,
+  canvasW: 0, canvasH: 0,
+  scale: 1,
+  panX: 0, panY: 0,
+  pressureEnabled: false,
+  lastPressure: 1,
+  snapLabel: '',
+  selectedIdx: -1,
+  textInput: null,
+};
+
+function snapLineAngle(x1,y1,x2,y2){
+  const dx=x2-x1,dy=y2-y1;
+  const angle=Math.atan2(dy,dx)*180/Math.PI;
+  const snapAngles=[0,45,90,135,180,-45,-90,-135,-180];
+  let closest=snapAngles[0],minDiff=360;
+  snapAngles.forEach(a=>{const d=Math.abs(((angle-a+540)%360)-180);if(d<minDiff){minDiff=d;closest=a;}});
+  if(minDiff>12) return {x2,y2,snapped:false,label:''};
+  const dist=Math.sqrt(dx*dx+dy*dy);
+  const rad=closest*Math.PI/180;
+  return {
+    x2:x1+Math.cos(rad)*dist,
+    y2:y1+Math.sin(rad)*dist,
+    snapped:true,
+    label:closest===0||closest===180||closest===-180?'HORIZONTAL':Math.abs(closest)===90?'VERTICAL':closest+'°'
+  };
+}
+
+function snapRect(x1,y1,x2,y2,squarify){
+  if(!squarify) return {x1,y1,x2,y2};
+  const w=Math.abs(x2-x1),h=Math.abs(y2-y1);
+  const s=Math.max(w,h);
+  return {x1,y1,x2:x1+(x2>x1?s:-s),y2:y1+(y2>y1?s:-s)};
+}
+
+function renderDrawTab(container){
+  // CSS
+  if(!document.getElementById('draw-css')){
+    const style=document.createElement('style');
+    style.id='draw-css';style.textContent=DRAW_CSS;document.head.appendChild(style);
+  }
+
+  const card=document.createElement('div');card.className='card';
+
+  // TITLE + actions
+  const titleRow=document.createElement('div');
+  titleRow.style.cssText='display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;';
+  const title=document.createElement('div');title.className='card-title';title.style.margin='0';title.textContent='✏ ZONE DE DESSIN — Apple Pencil Pro';
+  const actRow=document.createElement('div');actRow.style.cssText='display:flex;gap:8px;';
+
+  const undoBtn=document.createElement('button');undoBtn.className='btn btn-dark btn-sm';undoBtn.textContent='↩ Annuler';
+  undoBtn.onclick=()=>{if(drawState.strokes.length>0){drawState.redoStack.push(drawState.strokes.pop());redrawCanvas();}};
+
+  const redoBtn=document.createElement('button');redoBtn.className='btn btn-dark btn-sm';redoBtn.textContent='↪ Rétablir';
+  redoBtn.onclick=()=>{if(drawState.redoStack.length>0){drawState.strokes.push(drawState.redoStack.pop());redrawCanvas();}};
+
+  const clearBtn=document.createElement('button');clearBtn.className='btn btn-dark btn-sm';clearBtn.textContent='🗑 Effacer';
+  clearBtn.onclick=()=>{if(confirm('Effacer tout le dessin ?')){drawState.strokes=[];drawState.redoStack=[];redrawCanvas();}};
+
+  const saveBtn=document.createElement('button');saveBtn.className='btn btn-primary btn-sm';saveBtn.textContent='💾 Sauver image';
+  saveBtn.onclick=()=>{
+    const canvas=document.getElementById('draw-canvas');
+    const link=document.createElement('a');
+    link.download=(currentProject?.name||'dessin')+'-schema.png';
+    link.href=canvas.toDataURL('image/png');
+    link.click();
+  };
+
+  actRow.appendChild(undoBtn);actRow.appendChild(redoBtn);actRow.appendChild(clearBtn);actRow.appendChild(saveBtn);
+  titleRow.appendChild(title);titleRow.appendChild(actRow);card.appendChild(titleRow);
+
+  // TOOLBAR
+  const toolbar=document.createElement('div');toolbar.className='draw-toolbar';
+
+  // Tools
+  const tools=[
+    {id:'pen',icon:'✏',label:'Stylo libre'},
+    {id:'line',icon:'╱',label:'Ligne droite'},
+    {id:'rect',icon:'▭',label:'Rectangle'},
+    {id:'circle',icon:'○',label:'Ellipse'},
+    {id:'arrow',icon:'→',label:'Flèche'},
+    {id:'text',icon:'T',label:'Texte'},
+    {id:'eraser',icon:'⌫',label:'Gomme'},
+  ];
+
+  tools.forEach(t=>{
+    const b=document.createElement('button');
+    b.className='draw-tool-btn'+(drawState.tool===t.id?' active':'');
+    b.title=t.label;b.textContent=t.icon;
+    b.onclick=()=>{drawState.tool=t.id;document.querySelectorAll('.draw-tool-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');};
+    toolbar.appendChild(b);
+  });
+
+  const sep1=document.createElement('div');sep1.className='draw-sep';toolbar.appendChild(sep1);
+
+  // Colors
+  DRAW_COLORS.forEach(col=>{
+    const b=document.createElement('button');
+    b.className='draw-color-btn'+(drawState.color===col.hex?' active':'');
+    b.style.background=col.hex;b.title=col.label;
+    b.onclick=()=>{drawState.color=col.hex;document.querySelectorAll('.draw-color-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');};
+    toolbar.appendChild(b);
+  });
+
+  const sep2=document.createElement('div');sep2.className='draw-sep';toolbar.appendChild(sep2);
+
+  // Stroke width
+  const swLabel=document.createElement('span');swLabel.style.cssText='font-size:10px;color:#666;';swLabel.textContent='Épaisseur:';toolbar.appendChild(swLabel);
+  const sw=document.createElement('input');sw.type='range';sw.className='stroke-slider';sw.min=1;sw.max=20;sw.value=drawState.strokeWidth;
+  sw.oninput=e=>{drawState.strokeWidth=parseInt(e.target.value);};
+  toolbar.appendChild(sw);
+
+  const sep3=document.createElement('div');sep3.className='draw-sep';toolbar.appendChild(sep3);
+
+  // Snap toggles
+  const snapAngleBtn=document.createElement('button');
+  snapAngleBtn.className='draw-tool-btn'+(drawState.snapAngle?' active':'');
+  snapAngleBtn.title='Snap angles (0/45/90°)';snapAngleBtn.textContent='📐';
+  snapAngleBtn.onclick=()=>{drawState.snapAngle=!drawState.snapAngle;snapAngleBtn.classList.toggle('active',drawState.snapAngle);};
+  toolbar.appendChild(snapAngleBtn);
+
+  const snapShapeBtn=document.createElement('button');
+  snapShapeBtn.className='draw-tool-btn'+(drawState.snapShape?' active':'');
+  snapShapeBtn.title='Correction formes';snapShapeBtn.textContent='⬜';
+  snapShapeBtn.onclick=()=>{drawState.snapShape=!drawState.snapShape;snapShapeBtn.classList.toggle('active',drawState.snapShape);};
+  toolbar.appendChild(snapShapeBtn);
+
+  card.appendChild(toolbar);
+
+  // CANVAS WRAP
+  const wrap=document.createElement('div');wrap.id='draw-canvas-wrap';
+
+  const canvas=document.createElement('canvas');
+  canvas.id='draw-canvas';
+  canvas.style.cssText='display:block;width:100%;border-radius:10px;border:1px solid #1E1E1E;touch-action:none;';
+
+  const snapInd=document.createElement('div');snapInd.className='snap-indicator';snapInd.id='snap-indicator';
+
+  wrap.appendChild(canvas);wrap.appendChild(snapInd);card.appendChild(wrap);
+
+  // Help text
+  const help=document.createElement('div');
+  help.style.cssText='font-size:10px;color:#444;margin-top:8px;line-height:1.8;';
+  help.innerHTML='<strong style="color:#666">Apple Pencil Pro:</strong> Dessin précis avec pression · Lignes auto-corrigées (0°/45°/90°) · Formes rectangles et cercles nets<br><strong style="color:#666">Outil Texte:</strong> Appuyez pour ajouter une annotation · <strong style="color:#666">📐</strong> = snap angles · <strong style="color:#666">⬜</strong> = formes corrigées';
+  card.appendChild(help);
+  container.appendChild(card);
+
+  // Init canvas
+  initCanvas(canvas);
+}
+
+function initCanvas(canvas){
+  const dpr=window.devicePixelRatio||1;
+  const rect=canvas.getBoundingClientRect();
+  const w=Math.max(rect.width||700,700);
+  const h=Math.round(w*0.65);
+  canvas.width=w*dpr;canvas.height=h*dpr;
+  canvas.style.height=h+'px';
+  drawState.canvasW=w;drawState.canvasH=h;drawState.scale=dpr;
+
+  const ctx=canvas.getContext('2d');
+  ctx.scale(dpr,dpr);
+
+  // Background grid
+  drawGrid(ctx,w,h);
+
+  // Restore strokes
+  redrawCanvas();
+
+  // Events — pointer (works for Pencil + touch + mouse)
+  canvas.addEventListener('pointerdown',onPointerDown,{passive:false});
+  canvas.addEventListener('pointermove',onPointerMove,{passive:false});
+  canvas.addEventListener('pointerup',onPointerUp,{passive:false});
+  canvas.addEventListener('pointercancel',onPointerUp,{passive:false});
+  canvas.addEventListener('contextmenu',e=>e.preventDefault());
+}
+
+function drawGrid(ctx,w,h){
+  ctx.fillStyle='#0A0A0A';ctx.fillRect(0,0,w,h);
+  ctx.strokeStyle='#1A1A1A';ctx.lineWidth=.5;
+  const step=20;
+  for(let x=0;x<=w;x+=step){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+  for(let y=0;y<=h;y+=step){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+  // Major grid
+  ctx.strokeStyle='#222';ctx.lineWidth=.8;
+  for(let x=0;x<=w;x+=100){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+  for(let y=0;y<=h;y+=100){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+}
+
+function redrawCanvas(){
+  const canvas=document.getElementById('draw-canvas');if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  const dpr=drawState.scale;
+  const w=drawState.canvasW,h=drawState.canvasH;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  drawGrid(ctx,w,h);
+  drawState.strokes.forEach(s=>renderStroke(ctx,s));
+}
+
+function renderStroke(ctx,s){
+  ctx.save();
+  ctx.strokeStyle=s.color||'#F5ECD7';
+  ctx.fillStyle=s.color||'#F5ECD7';
+  ctx.lineWidth=s.width||2;
+  ctx.lineCap='round';ctx.lineJoin='round';
+
+  if(s.type==='pen'&&s.points&&s.points.length>1){
+    ctx.beginPath();ctx.moveTo(s.points[0].x,s.points[0].y);
+    for(let i=1;i<s.points.length;i++){
+      const prev=s.points[i-1],curr=s.points[i];
+      const mx=(prev.x+curr.x)/2,my=(prev.y+curr.y)/2;
+      ctx.quadraticCurveTo(prev.x,prev.y,mx,my);
+    }
+    ctx.stroke();
+  } else if(s.type==='line'){
+    ctx.beginPath();ctx.moveTo(s.x1,s.y1);ctx.lineTo(s.x2,s.y2);ctx.stroke();
+    // Arrow heads if arrow type
+  } else if(s.type==='arrow'){
+    drawArrow(ctx,s.x1,s.y1,s.x2,s.y2,s.width||2);
+  } else if(s.type==='rect'){
+    ctx.beginPath();ctx.rect(s.x,s.y,s.w,s.h);ctx.stroke();
+  } else if(s.type==='circle'){
+    ctx.beginPath();ctx.ellipse(s.cx,s.cy,s.rx,s.ry,0,0,Math.PI*2);ctx.stroke();
+  } else if(s.type==='text'){
+    ctx.font=`${s.fontSize||14}px 'DM Mono',monospace`;
+    ctx.fillText(s.text||'',s.x,s.y);
+  } else if(s.type==='eraser'&&s.points){
+    ctx.globalCompositeOperation='destination-out';
+    ctx.lineWidth=s.width*3||20;
+    ctx.beginPath();ctx.moveTo(s.points[0].x,s.points[0].y);
+    s.points.forEach(p=>ctx.lineTo(p.x,p.y));ctx.stroke();
+    ctx.globalCompositeOperation='source-over';
+  }
+  ctx.restore();
+}
+
+function drawArrow(ctx,x1,y1,x2,y2,w){
+  const angle=Math.atan2(y2-y1,x2-x1);
+  const hw=Math.max(w*3,8);
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-hw*Math.cos(angle-Math.PI/6),y2-hw*Math.sin(angle-Math.PI/6));
+  ctx.lineTo(x2-hw*Math.cos(angle+Math.PI/6),y2-hw*Math.sin(angle+Math.PI/6));
+  ctx.closePath();ctx.fill();
+}
+
+function getCanvasPos(canvas,e){
+  const rect=canvas.getBoundingClientRect();
+  const scaleX=drawState.canvasW/rect.width;
+  const scaleY=drawState.canvasH/rect.height;
+  const clientX=e.clientX||e.touches?.[0]?.clientX||0;
+  const clientY=e.clientY||e.touches?.[0]?.clientY||0;
+  return {x:(clientX-rect.left)*scaleX,y:(clientY-rect.top)*scaleY};
+}
+
+function onPointerDown(e){
+  e.preventDefault();
+  const canvas=e.target;
+  const {x,y}=getCanvasPos(canvas,e);
+  drawState.isDrawing=true;
+  drawState.startX=x;drawState.startY=y;
+  drawState.lastPressure=e.pressure>0?e.pressure:1;
+  drawState.redoStack=[];
+
+  if(drawState.tool==='text'){
+    const text=prompt('Saisissez votre annotation:');
+    if(text){
+      drawState.strokes.push({type:'text',x,y,text,color:drawState.color,fontSize:14});
+      redrawCanvas();
+    }
+    drawState.isDrawing=false;return;
+  }
+
+  if(drawState.tool==='pen'||drawState.tool==='eraser'){
+    const sw=drawState.tool==='eraser'?drawState.strokeWidth*3:drawState.strokeWidth;
+    drawState.currentStroke={type:drawState.tool,color:drawState.color,width:sw,points:[{x,y,p:e.pressure||1}]};
+  }
+}
+
+function onPointerMove(e){
+  e.preventDefault();
+  if(!drawState.isDrawing) return;
+  const canvas=e.target;
+  const {x,y}=getCanvasPos(canvas,e);
+  const ctx=canvas.getContext('2d');
+
+  if(drawState.tool==='pen'||drawState.tool==='eraser'){
+    drawState.currentStroke.points.push({x,y,p:e.pressure||1});
+    // Draw incrementally
+    ctx.save();
+    ctx.strokeStyle=drawState.currentStroke.color;
+    ctx.lineWidth=drawState.currentStroke.width;
+    ctx.lineCap='round';ctx.lineJoin='round';
+    if(drawState.tool==='eraser') ctx.globalCompositeOperation='destination-out';
+    const pts=drawState.currentStroke.points;
+    if(pts.length>=2){
+      const prev=pts[pts.length-2],curr=pts[pts.length-1];
+      ctx.beginPath();ctx.moveTo(prev.x,prev.y);ctx.lineTo(curr.x,curr.y);ctx.stroke();
+    }
+    ctx.restore();
+  } else {
+    // Preview shapes
+    redrawCanvas();
+    ctx.save();
+    ctx.strokeStyle=drawState.color;ctx.fillStyle=drawState.color;
+    ctx.lineWidth=drawState.strokeWidth;ctx.lineCap='round';ctx.lineJoin='round';
+    ctx.setLineDash([5,5]);
+
+    const sx=drawState.startX,sy=drawState.startY;
+    const snapInd=document.getElementById('snap-indicator');
+
+    if(drawState.tool==='line'||drawState.tool==='arrow'){
+      let tx=x,ty=y,snapLabel='';
+      if(drawState.snapAngle){
+        const s=snapLineAngle(sx,sy,x,y);
+        tx=s.x2;ty=s.y2;snapLabel=s.label;
+      }
+      if(snapInd){if(snapLabel){snapInd.textContent=snapLabel;snapInd.classList.add('show');}else snapInd.classList.remove('show');}
+      if(drawState.tool==='arrow') drawArrow(ctx,sx,sy,tx,ty,drawState.strokeWidth);
+      else{ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(tx,ty);ctx.stroke();}
+    } else if(drawState.tool==='rect'){
+      const rw=x-sx,rh=y-sy;
+      ctx.beginPath();ctx.rect(sx,sy,rw,rh);ctx.stroke();
+    } else if(drawState.tool==='circle'){
+      const rx=Math.abs(x-sx)/2,ry=Math.abs(y-sy)/2;
+      const cx=sx+(x-sx)/2,cy=sy+(y-sy)/2;
+      ctx.beginPath();ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);ctx.stroke();
+    }
+    ctx.setLineDash([]);ctx.restore();
+  }
+}
+
+function onPointerUp(e){
+  if(!drawState.isDrawing) return;
+  drawState.isDrawing=false;
+  const canvas=document.getElementById('draw-canvas');
+  if(!canvas) return;
+  const {x,y}=getCanvasPos(canvas,e);
+  const sx=drawState.startX,sy=drawState.startY;
+  const snapInd=document.getElementById('snap-indicator');
+  if(snapInd) snapInd.classList.remove('show');
+
+  if(drawState.tool==='pen'||drawState.tool==='eraser'){
+    if(drawState.currentStroke&&drawState.currentStroke.points.length>1){
+      drawState.strokes.push(drawState.currentStroke);
+    }
+    drawState.currentStroke=null;
+  } else if(drawState.tool==='line'||drawState.tool==='arrow'){
+    let tx=x,ty=y;
+    if(drawState.snapAngle){const s=snapLineAngle(sx,sy,x,y);tx=s.x2;ty=s.y2;}
+    const dist=Math.sqrt((tx-sx)**2+(ty-sy)**2);
+    if(dist>5) drawState.strokes.push({type:drawState.tool,x1:sx,y1:sy,x2:tx,y2:ty,color:drawState.color,width:drawState.strokeWidth});
+  } else if(drawState.tool==='rect'){
+    const rw=x-sx,rh=y-sy;
+    if(Math.abs(rw)>5&&Math.abs(rh)>5) drawState.strokes.push({type:'rect',x:sx,y:sy,w:rw,h:rh,color:drawState.color,width:drawState.strokeWidth});
+  } else if(drawState.tool==='circle'){
+    const rx=Math.abs(x-sx)/2,ry=Math.abs(y-sy)/2;
+    const cx=sx+(x-sx)/2,cy=sy+(y-sy)/2;
+    if(rx>3&&ry>3) drawState.strokes.push({type:'circle',cx,cy,rx,ry,color:drawState.color,width:drawState.strokeWidth});
+  }
+  redrawCanvas();
+}
+
+
 </script>
 </body>
 </html>
